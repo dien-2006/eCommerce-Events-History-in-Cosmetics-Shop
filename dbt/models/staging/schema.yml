@@ -1,0 +1,30 @@
+version: 2
+
+sources:
+  - name: cosmetics_bronze
+    database: rest
+    schema: cosmetics_bronze
+    tables:
+      - name: events_history
+
+models:
+  - name: stg_events
+    description: "Silver staging events: typed + deduped"
+    columns:
+      - name: event_ts
+        tests: [not_null]
+      - name: event_date
+        tests: [not_null]
+      - name: event_type
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["purchase", "view", "cart"]
+      - name: user_id
+        tests: [not_null]
+      - name: product_id
+        tests: [not_null]
+      - name: event_dedup_key
+        tests:
+          - not_null
+          - unique

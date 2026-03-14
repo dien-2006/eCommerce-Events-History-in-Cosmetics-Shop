@@ -1,0 +1,30 @@
+version: 2
+
+models:
+  - name: funnel_steps_daily
+    columns:
+      - name: event_date
+        tests: [not_null, unique]
+      - name: users_purchase
+        tests: [not_null]
+
+  - name: daily_sales_by_category
+    columns:
+      - name: event_date
+        tests: [not_null]
+      - name: category_code
+        tests: [not_null]
+      - name: event_date__category_code
+        tests: [not_null, unique]
+
+  - name: rfm_segments
+    columns:
+      - name: snapshot_date
+        tests: [not_null]
+      - name: user_id
+        tests: [not_null]
+      - name: segment
+        tests:
+          - not_null
+          - accepted_values:
+              values: ["champions", "loyal", "at_risk", "others"]

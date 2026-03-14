@@ -1,0 +1,264 @@
+name: cosmetics-lakehouse
+
+networks:
+  lakehouse_net:
+    name: ${DOCKER_NETWORK_NAME}
+    driver: bridge
+
+volumes:
+  minio_data:
+  clickhouse_data:
+  superset_db_data:
+  superset_redis_data:
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL}
+    ports:
+      - "${MINIO_API_PORT}:9000"
+      - "${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - lakehouse_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  minio_init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ALIAS: ${MINIO_ALIAS}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT_INTERNAL}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["/scripts/create_bucket.sh"]
+    volumes:
+      - ./scripts/create_bucket.sh:/scripts/create_bucket.sh:ro
+    networks:
+      - lakehouse_net
+
+  iceberg_rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: iceberg-rest
+    environment:
+      # NOTE: this image is a lightweight REST catalog for experimentation.
+      # These env vars are used by common Iceberg REST fixtures; if your image build differs,
+      # see docs/README_TROUBLESHOOTING.md for fallback options.
+      CATALOG_WAREHOUSE: ${ICEBERG_WAREHOUSE}
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      AWS_REGION: ${AWS_REGION}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_ENDPOINT: ${MINIO_ENDPOINT_INTERNAL}
+      AWS_S3_PATH_STYLE_ACCESS: "true"
+    ports:
+      - "${ICEBERG_REST_PORT}:8181"
+    networks:
+      - lakehouse_net
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8181/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spark-master:
+    image: spark:3.5.7-java17-python3
+    container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+    ports:
+      - "${SPARK_MASTER_UI_PORT}:8080"
+      - "${SPARK_MASTER_PORT}:7077"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/jars:/opt/spark/jars
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - ./data:/data
+    networks:
+      - lakehouse_net
+    depends_on:
+      iceberg_rest:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spark-worker-1:
+    image: spark:3.5.7-java17-python3
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    ports:
+      - "${SPARK_WORKER1_UI_PORT}:8081"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/jars:/opt/spark/jars
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - ./data:/data
+    networks:
+      - lakehouse_net
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  spark-worker-2:
+    image: spark:3.5.7-java17-python3
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+      SPARK_WORKER_WEBUI_PORT: "8082"
+    ports:
+      - "${SPARK_WORKER2_UI_PORT}:8082"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ./spark/jars:/opt/spark/jars
+      - ./spark/jobs:/opt/spark/jobs:ro
+      - ./data:/data
+    networks:
+      - lakehouse_net
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8082/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.12.6.38-jammy
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT}:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
+      - ./clickhouse/initdb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - lakehouse_net
+    depends_on:
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "clickhouse-client --host localhost --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  superset-db:
+    image: postgres:16.2-alpine
+    container_name: superset-db
+    environment:
+      POSTGRES_DB: ${SUPERSET_DB_NAME}
+      POSTGRES_USER: ${SUPERSET_DB_USER}
+      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD}
+    ports:
+      - "${SUPERSET_DB_PORT}:5432"
+    volumes:
+      - superset_db_data:/var/lib/postgresql/data
+    networks:
+      - lakehouse_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_DB_USER} -d ${SUPERSET_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  superset-redis:
+    image: redis:7.2.5-alpine
+    container_name: superset-redis
+    ports:
+      - "${SUPERSET_REDIS_PORT}:6379"
+    volumes:
+      - superset_redis_data:/data
+    networks:
+      - lakehouse_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: superset
+    environment:
+      SUPERSET_ENV: production
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SUPERSET_LOAD_EXAMPLES: "no"
+      SUPERSET_PORT: "8088"
+      DATABASE_DB: ${SUPERSET_DB_NAME}
+      DATABASE_HOST: superset-db
+      DATABASE_PASSWORD: ${SUPERSET_DB_PASSWORD}
+      DATABASE_USER: ${SUPERSET_DB_USER}
+      DATABASE_PORT: "5432"
+      DATABASE_DIALECT: postgresql
+      REDIS_HOST: superset-redis
+      REDIS_PORT: "6379"
+      # enable clickhouse dialect via clickhouse-connect installed in Dockerfile
+    ports:
+      - "${SUPERSET_PORT}:8088"
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset/init:/app/docker-init:ro
+    networks:
+      - lakehouse_net
+    depends_on:
+      superset-db:
+        condition: service_healthy
+      superset-redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
