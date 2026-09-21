@@ -1,35 +1,21 @@
 name: cosmetics_lakehouse
-version: "1.0.0"
+version: "2.0.0"
 config-version: 2
-
 profile: cosmetics_lakehouse
-
-model-paths: ["models"]
-analysis-paths: ["analysis"]
-test-paths: ["tests"]
-macro-paths: ["macros"]
-seed-paths: ["seeds"]
-snapshot-paths: ["snapshots"]
-
-target-path: "target"
-clean-targets: ["target", "dbt_packages"]
-
+model-paths: [models]
+test-paths: [tests]
+macro-paths: [macros]
+clean-targets: [target, dbt_packages]
+vars:
+  project_name: cosmetics
+  max_invalid_ratio: 0.01
 models:
   cosmetics_lakehouse:
-    +materialized: view
+    +file_format: iceberg
+    +tblproperties:
+      format-version: "2"
     staging:
-      +schema: cosmetics_silver
-      +materialized: incremental
-      +incremental_strategy: append
-      +on_schema_change: append_new_columns
-      +file_format: iceberg
-      +tblproperties:
-        format-version: "2"
+      +schema: "{{ var('project_name', 'cosmetics') }}_silver"
     gold:
-      +schema: cosmetics_gold
-      +materialized: incremental
-      +incremental_strategy: append
-      +on_schema_change: append_new_columns
-      +file_format: iceberg
-      +tblproperties:
-        format-version: "2"
+      +schema: "{{ var('project_name', 'cosmetics') }}_gold"
+      +materialized: table

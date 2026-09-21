@@ -1,0 +1,10 @@
+<clickhouse>
+  <profiles><dashboard_readonly><readonly>1</readonly><max_execution_time>60</max_execution_time></dashboard_readonly></profiles>
+  <users><dashboard>
+    <password from_env="CLICKHOUSE_DASHBOARD_PASSWORD" />
+    <networks><ip>::/0</ip></networks>
+    <profile>dashboard_readonly</profile>
+    <quota>default</quota>
+    <allow_databases><database>cosmetics_analytics</database></allow_databases>
+  </dashboard></users>
+</clickhouse>

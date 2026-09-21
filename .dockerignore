@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+.venv
+data
+artifacts
+backups
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+dbt/target
+dbt/logs
+spark/jars
+metastore_db
+derby.log
+spark-warehouse

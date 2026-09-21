@@ -1,0 +1,4 @@
+<clickhouse>
+  <!-- Serving is published over HTTP with explicit schemas; no raw bucket credentials here. -->
+  <logger><level>warning</level><console>true</console></logger>
+</clickhouse>

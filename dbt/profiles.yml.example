@@ -1,27 +1,17 @@
 cosmetics_lakehouse:
-  target: dev
+  target: local
   outputs:
-    dev:
+    local:
       type: spark
       method: thrift
-      host: "{{ env_var('DBT_SPARK_HOST', 'spark-master') }}"
-      port: "{{ env_var('DBT_SPARK_THRIFT_PORT', '10000') | int }}"
-      user: "spark"
-      schema: "{{ env_var('DBT_SCHEMA', 'cosmetics_silver') }}"
-      connect_retries: 3
-      connect_timeout: 30
-      threads: 4
-      # Spark configs for Iceberg + MinIO (dbt-spark passes these to the session)
-      conf:
-        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
-        "spark.sql.catalog.rest": "org.apache.iceberg.spark.SparkCatalog"
-        "spark.sql.catalog.rest.catalog-impl": "org.apache.iceberg.rest.RESTCatalog"
-        "spark.sql.catalog.rest.uri": "{{ env_var('ICEBERG_REST_URI') }}"
-        "spark.sql.catalog.rest.warehouse": "{{ env_var('ICEBERG_WAREHOUSE') }}"
-        "spark.hadoop.fs.s3a.endpoint": "{{ env_var('MINIO_ENDPOINT_INTERNAL') }}"
-        "spark.hadoop.fs.s3a.access.key": "{{ env_var('MINIO_ROOT_USER') }}"
-        "spark.hadoop.fs.s3a.secret.key": "{{ env_var('MINIO_ROOT_PASSWORD') }}"
-        "spark.hadoop.fs.s3a.path.style.access": "true"
-        "spark.hadoop.fs.s3a.connection.ssl.enabled": "false"
-        "spark.sql.iceberg.merge-schema": "true"
-        "spark.sql.parquet.mergeSchema": "true"
+      host: "{{ env_var('SPARK_THRIFT_HOST', 'spark-thrift') }}"
+      port: "{{ env_var('SPARK_THRIFT_PORT', '10000') | int }}"
+      auth: NOSASL
+      user: pipeline
+      schema: default
+      threads: 1
+      connect_retries: 5
+      connect_timeout: 15
+      retry_all: true
+      server_side_parameters:
+        spark.sql.session.timeZone: UTC

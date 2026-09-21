@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-source .env
-
-echo "== MinIO (live) =="
-curl -fsS "http://localhost:${MINIO_API_PORT}/minio/health/live" >/dev/null && echo "OK"
-
-echo "== MinIO Console =="
-curl -fsS "http://localhost:${MINIO_CONSOLE_PORT}/" >/dev/null && echo "OK"
-
-echo "== Iceberg REST =="
-curl -fsS "http://localhost:${ICEBERG_REST_PORT}/" >/dev/null && echo "OK"
-
-echo "== Spark Master UI =="
-curl -fsS "http://localhost:${SPARK_MASTER_UI_PORT}/" >/dev/null && echo "OK"
-
-echo "== ClickHouse ping =="
-curl -fsS "http://localhost:${CLICKHOUSE_HTTP_PORT}/ping" && echo
-
-echo "== Superset health =="
-curl -fsS "http://localhost:${SUPERSET_PORT}/health" && echo
-
-echo "All services look up."
+cd "$(dirname "$0")/.."
+docker compose --env-file .env.deploy ps
+python3 scripts/check_services.py
+docker compose --env-file .env.deploy exec -T airflow-scheduler python -c '
+import json, subprocess
+from lakehouse.config import load_projects
+errors = json.loads(subprocess.check_output(["airflow", "dags", "list-import-errors", "--output", "json"]))
+print(json.dumps(errors, indent=2))
+if errors:
+    raise SystemExit("Airflow has DAG import errors")
+dags = json.loads(subprocess.check_output(["airflow", "dags", "list", "--output", "json"]))
+missing = {f"{name}_elt" for name in load_projects()} - {dag["dag_id"] for dag in dags}
+if missing:
+    raise SystemExit(f"Missing project DAGs: {sorted(missing)}")
+'
+docker compose --env-file .env.deploy exec -T airflow-scheduler \
+  /opt/pipeline-venv/bin/python -m lakehouse.cli status

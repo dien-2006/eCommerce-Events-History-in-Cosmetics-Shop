@@ -1,46 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-export FLASK_APP="superset"
-
-# Wait for DB
-echo "[superset] Waiting for metadata DB..."
-python - <<'PY'
-import os, time
-import psycopg2
-
-cfg = dict(
-  dbname=os.environ["DATABASE_DB"],
-  user=os.environ["DATABASE_USER"],
-  password=os.environ["DATABASE_PASSWORD"],
-  host=os.environ["DATABASE_HOST"],
-  port=int(os.environ["DATABASE_PORT"]),
-)
-for i in range(60):
-  try:
-    psycopg2.connect(**cfg).close()
-    print("DB ready")
-    break
-  except Exception:
-    time.sleep(1)
-else:
-  raise SystemExit("DB not ready")
-PY
-
-echo "[superset] Upgrading DB..."
 superset db upgrade
-
-echo "[superset] Creating admin (idempotent)..."
-superset fab create-admin \
-  --username admin \
-  --firstname Admin \
-  --lastname User \
-  --email admin@example.com \
-  --password admin \
-  || true
-
-echo "[superset] Initializing roles/permissions..."
+python - <<'PYTHON'
+import os
+from superset.app import create_app
+from superset.extensions import appbuilder
+app = create_app()
+with app.app_context():
+    sm = appbuilder.sm
+    username = os.environ['SUPERSET_ADMIN_USER']
+    if not sm.find_user(username=username):
+        sm.add_user(username, 'Platform', 'Admin', 'admin@example.com',
+                    sm.find_role('Admin'), password=os.environ['SUPERSET_ADMIN_PASSWORD'])
+PYTHON
 superset init
-
-echo "[superset] Starting server..."
-superset run -h 0.0.0.0 -p 8088
+python /app/docker-init/provision.py
+exec gunicorn --bind 0.0.0.0:8088 --workers 2 --worker-class gthread --threads 4 \
+  --timeout 120 --access-logfile - --error-logfile - 'superset.app:create_app()'

@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cosmetics-lakehouse"
+version = "2.0.0"
+description = "Auditable ELT for commerce events, orchestrated by Apache Airflow"
+requires-python = ">=3.11,<3.13"
+dependencies = []
+
+[project.scripts]
+lakehouse = "lakehouse.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["lakehouse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a running Spark Thrift server and Iceberg catalog"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

@@ -1,0 +1,6 @@
+boto3==1.40.40
+psycopg[binary]==3.2.10
+clickhouse-connect==0.8.18
+PyYAML==6.0.2
+dbt-core==1.11.0
+dbt-spark[PyHive]==1.11.0

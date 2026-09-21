@@ -1,0 +1,10 @@
+# A project gets its own DAG, namespaces, raw prefix and ClickHouse database.
+# New domains need their own dbt project and contract; this is an events template.
+projects:
+  cosmetics:
+    owner: data-platform
+    schedule: "0 2 * * *"
+    input_dir: /data/rawdata
+    dbt_dir: /opt/project/dbt
+    max_invalid_ratio: 0.01
+    description: Cosmetics commerce events — raw landing, Iceberg, dbt, ClickHouse

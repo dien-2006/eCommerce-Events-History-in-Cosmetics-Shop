@@ -1,30 +1,33 @@
 version: 2
-
 sources:
-  - name: cosmetics_bronze
-    database: rest
-    schema: cosmetics_bronze
+  - name: bronze
+    schema: "{{ var('project_name') }}_bronze"
     tables:
       - name: events_history
-
+        description: Raw CSV strings and file identity; business rows are not discarded.
 models:
   - name: stg_events
-    description: "Silver staging events: typed + deduped"
+    description: Valid events; full-source deterministic dedup and Iceberg MERGE across files.
     columns:
-      - name: event_ts
-        tests: [not_null]
-      - name: event_date
-        tests: [not_null]
-      - name: event_type
-        tests:
-          - not_null
-          - accepted_values:
-              values: ["purchase", "view", "cart"]
-      - name: user_id
-        tests: [not_null]
-      - name: product_id
-        tests: [not_null]
       - name: event_dedup_key
-        tests:
-          - not_null
-          - unique
+        data_tests: [not_null, unique]
+      - name: event_ts
+        data_tests: [not_null]
+      - name: event_date
+        data_tests: [not_null]
+      - name: user_id
+        data_tests: [not_null]
+      - name: product_id
+        data_tests: [not_null]
+      - name: price
+        data_tests: [not_null]
+      - name: event_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [view, cart, remove_from_cart, purchase]
+  - name: quarantine_events
+    description: Rejected records with a rejection reason; raw objects remain available for replay.
+    columns:
+      - name: rejection_reason
+        data_tests: [not_null]

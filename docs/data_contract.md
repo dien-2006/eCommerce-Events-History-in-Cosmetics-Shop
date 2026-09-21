@@ -1,144 +1,56 @@
-# Data Contract — REES46 Cosmetics eCommerce Events History (Purchase-only dataset)
+# Data contract — commerce events v2
 
-## Source
-Kaggle dataset: "eCommerce Events History in Cosmetics Shop"
-- event_time (UTC string)
-- event_type (purchase only, but treat as enum for future extension)
-- product_id, category_id, category_code, brand, price
-- user_id, user_session
+## Nguồn và phạm vi
 
-## Naming conventions
-- Catalog: `rest`
-- Databases:
-  - Bronze: `cosmetics_bronze`
-  - Silver: `cosmetics_silver`
-  - Gold: `cosmetics_gold`
-- Tables:
-  - Bronze raw: `events_history`
-  - Silver: `stg_events`
-  - Gold: `funnel_steps_daily`, `daily_sales_by_category`, `rfm_segments`
+Dữ liệu hiện có: 5 CSV tháng 10/2019–02/2020 trong `data/rawdata/`, khoảng 2,3 GiB. Kiểm tra mẫu mỗi file xác nhận 4 loại sự kiện, không phải purchase-only. Contract xử lý UTF-8/UTF-8 BOM, header có thể đảo thứ tự; một record trên một dòng, không hỗ trợ trường CSV chứa xuống dòng.
 
-## S3 paths (MinIO)
-- Warehouse root: `s3a://cosmetics-lakehouse/warehouse/`
-- Iceberg managed tables:
-  - `.../warehouse/<db>.db/<table>/`
-- Quarantine:
-  - `s3a://cosmetics-lakehouse/quarantine/events_history/`
+File phải hoàn chỉnh trước khi vào input. File thay đổi có SHA khác và được xem như nguồn sự kiện bổ sung. Khi cần thay thế một file lỗi đã nạp, dùng retirement có audit và full rebuild theo [runbook](operations.md#thay-thế-file-nguồn-bị-lỗi); không chỉ ghi đè filename.
 
----
-
-## Bronze schema (raw + metadata)
-**Table**: `rest.cosmetics_bronze.events_history`
-
-| column | type | notes |
+| Cột nguồn | Kiểu Bronze | Quy tắc Silver |
 |---|---|---|
-| event_time | STRING | raw, as-is |
-| event_type | STRING | raw |
-| product_id | STRING | raw |
-| category_id | STRING | raw |
-| category_code | STRING | raw nullable |
-| brand | STRING | raw nullable |
-| price | STRING | raw (cast later) |
-| user_id | STRING | raw |
-| user_session | STRING | raw |
-| payment_method | STRING | nullable; example schema evolution column |
-| _ingestion_time | STRING | ISO8601 UTC |
-| _source_file | STRING | input file path |
-| _batch_id | STRING | batch identifier |
+| event_time | string | Timestamp UTC, chấp nhận hậu tố ` UTC`; không parse được → quarantine |
+| event_type | string | trim/lower; view, cart, remove_from_cart, purchase |
+| product_id | string | bigint > 0 |
+| category_id | string | bigint nullable; không parse được khi có giá trị → quarantine |
+| category_code | string | lower/trim; null/rỗng → unknown |
+| brand | string | lower/trim; null/rỗng → unknown |
+| price | string | decimal(18,2), >=0; thiếu/không hợp lệ/âm → quarantine |
+| user_id | string | bigint > 0 |
+| user_session | string | trim, không null/rỗng |
+| payment_method | string, tùy chọn | nullable; lower/trim |
 
-**Bronze partition spec**
-- `PARTITIONED BY (_batch_id)` for easy incremental demo and rollback by batch
+Header thiếu cột bắt buộc, trùng tên hoặc có cột chưa khai báo làm stage fail. Bản raw vẫn được giữ để điều tra. Cần review contract và migration trước khi thêm trường mới.
 
----
+## Grain và định danh
 
-## Silver schema (cleaned / typed)
-**Table**: `rest.cosmetics_silver.stg_events`
+- Raw: một object trên một nội dung file duy nhất; SHA-256 không phụ thuộc tên file.
+- Bronze: giữ mọi record đọc được, kể cả duplicate và malformed row; `_corrupt_record`, `_file_sha256`, `_source_uri`, `_ingested_at`, `_run_key` truy vết về raw. Partition theo SHA file.
+- Silver: một sự kiện theo khóa hash của `user_id, user_session, product_id, event_ts, event_type, price` sau chuẩn hóa. Các record cùng khóa chọn ingestion mới nhất, rồi file SHA và các thuộc tính category/brand/payment_method làm tie-breaker ổn định.
+- Do không có event ID nguồn, hai sự kiện hợp lệ giống hệt tất cả trường khóa không thể phân biệt và sẽ gộp. Không coi đây là bảo đảm dedup tuyệt đối theo sự kiện thực tế. Một correction đổi price cũng tạo khóa khác.
+- Quarantine: một record Bronze bị loại với `rejection_reason`; giữ các giá trị thô. Trước công bố, tỷ lệ lỗi toàn bộ **và mỗi file** phải <= `max_invalid_ratio` (mặc định 1%).
 
-| column | type | notes |
-|---|---|---|
-| event_ts | TIMESTAMP | parsed from event_time (UTC) |
-| event_date | DATE | derived from event_ts |
-| event_type | STRING | standardized enum: purchase/view/cart (future-proof) |
-| product_id | BIGINT | cast |
-| category_id | BIGINT | cast |
-| category_code | STRING | normalized (lowercase) |
-| brand | STRING | normalized (lowercase) |
-| price | DOUBLE | currency assumed: dataset currency (treat as unit price) |
-| user_id | BIGINT | cast |
-| user_session | STRING | keep session id |
-| payment_method | STRING | nullable; passed through if present |
-| _ingestion_time | TIMESTAMP | casted from ISO8601 |
-| _source_file | STRING | |
-| _batch_id | STRING | |
+## Gold
 
-**Silver dedup keys**
-- natural key (recommended): `(user_id, user_session, product_id, event_ts)`
-- rule: keep the latest `_ingestion_time` if duplicates exist
+### daily_sales_by_category
 
-**Silver partition spec**
-- `PARTITIONED BY (days(event_ts))` (or `event_date`) for query pruning
+Grain: `(event_date, category_code, brand)`. `revenue` là sum price của purchase event; `purchase_events` là count sự kiện; `purchasing_sessions` là count distinct `(user_id, user_session)` **trong nhóm**; `avg_purchase_event_value` là revenue / purchase_events.
 
----
+Không có order_id, quantity, thuế, refund, phí vận chuyển hoặc mã tiền tệ đủ để suy ra doanh thu tài chính/GMV chuẩn. Không gọi purchase_events là đơn hàng, không gọi giá trị trung bình này là AOV đơn hàng. Số phiên mua không được cộng qua danh mục vì một phiên có thể thuộc nhiều nhóm. Trung bình cũng không được cộng hoặc lấy trung bình không trọng số.
 
-## Gold schema (marts)
+### funnel_steps_daily
 
-### 1) funnel_steps_daily (future-proof)
-**Table**: `rest.cosmetics_gold.funnel_steps_daily`
-| column | type | notes |
-|---|---|---|
-| event_date | DATE | partition column |
-| users_view | BIGINT | users who viewed |
-| users_cart | BIGINT | users who carted |
-| users_purchase | BIGINT | users who purchased |
-| conv_view_to_cart | DOUBLE | users_cart/users_view |
-| conv_cart_to_purchase | DOUBLE | users_purchase/users_cart |
-| conv_view_to_purchase | DOUBLE | users_purchase/users_view |
+Grain: ngày bắt đầu phiên `(user_id, user_session)` theo sự kiện sớm nhất quan sát được. Tìm view đầu tiên, cart đầu tiên sau view, purchase đầu tiên sau cart. Cho phép timestamp bằng nhau do nguồn chỉ có độ phân giải giây. Phiên qua nửa đêm vẫn thuộc ngày bắt đầu.
 
-**Partition spec**
-- `PARTITIONED BY (days(event_date))` (or identity on date if used as DATE column)
+`sessions_total >= sessions_view >= sessions_cart_after_view >= sessions_purchase_after_cart`; các tỷ lệ nằm trong [0,1], mẫu số 0 cho kết quả 0. Một purchase không có chuỗi view/cart hợp lệ vẫn tính trong Sales nhưng không tính chuyển đổi funnel. Remove-from-cart được giữ trong Silver, không phải bước funnel; chưa mô hình hóa trạng thái giỏ theo sản phẩm.
 
-### 2) daily_sales_by_category
-**Table**: `rest.cosmetics_gold.daily_sales_by_category`
-| column | type |
-|---|---|
-| event_date | DATE |
-| category_code | STRING |
-| revenue | DOUBLE |
-| orders | BIGINT |
-| aov | DOUBLE |
+### rfm_segments
 
-**Partition spec**
-- `PARTITIONED BY (days(event_date))`
-**Sort recommendation**
-- sort within files by `(event_date, category_code)`
+Grain: một user tại ngày snapshot được chọn. Mặc định snapshot_date là max(event_date) của Silver; có thể chỉ định ngày qua tham số DAG. Chỉ purchase không muộn hơn snapshot được tính. Đây là bảng snapshot hiện tại, lịch sử các lần công bố còn trong ClickHouse releases/Iceberg snapshots theo retention.
 
-### 3) rfm_segments
-**Table**: `rest.cosmetics_gold.rfm_segments`
-| column | type |
-|---|---|
-| snapshot_date | DATE |
-| user_id | BIGINT |
-| recency_days | INT |
-| frequency | BIGINT |
-| monetary | DOUBLE |
-| r_score | INT |
-| f_score | INT |
-| m_score | INT |
-| segment | STRING |
+Recency: số ngày từ lần mua gần nhất. Frequency: số phiên có mua. Monetary: tổng price purchase. `5-floor(4*percent_rank())` với chiều sắp xếp phù hợp cho điểm 5 tốt nhất, 1 thấp nhất; ties nhận cùng điểm. Một tập chỉ có một giá trị nhận 5; đây không phải chia năm nhóm bằng số lượng như ntile.
 
-**Partition spec**
-- `PARTITIONED BY (days(snapshot_date))`
-**Segmentation rules**
-- simplest demo: quintiles per metric (1..5), segment label from RFM triple
+Các nhãn champions, loyal, at_risk, hibernating, others là quy tắc phân tích mẫu, chưa được hiệu chỉnh theo chiến dịch marketing hay giá trị vòng đời khách hàng thật.
 
----
+## Khác biệt so với v1
 
-## Partition recommendations summary
-- Bronze: `_batch_id` (simple incremental loads)
-- Silver: day(event_ts)
-- Gold: day(event_date / snapshot_date)
-
----
-
-## Currency assumptions
-- `price` treated as unit price in dataset currency; no FX conversion in this project.
+Catalog `rest` → `lakehouse`; ClickHouse `analytics` → `cosmetics_analytics`; bỏ tên orders/aov và funnel đếm user không theo thứ tự. Không migrate trực tiếp bảng v1. Triển khai v2 vào volumes/bucket mới, replay raw, đối soát rồi mới chuyển người dùng dashboard. Không xóa dữ liệu v1 trong quá trình này.

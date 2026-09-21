@@ -1,14 +1,10 @@
 FROM apache/superset:6.0.0
-
 USER root
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-# init scripts
-COPY init/superset_init.sh /app/docker-init/superset_init.sh
+COPY requirements.txt /app/requirements-lakehouse.txt
+RUN . /app/.venv/bin/activate && uv pip install -r /app/requirements-lakehouse.txt
+COPY superset_config.py /app/pythonpath/superset_config.py
+COPY init /app/docker-init
 RUN chmod +x /app/docker-init/superset_init.sh
-
 USER superset
-
-ENV PYTHONPATH=/app/pythonpath
-CMD ["/app/docker-init/superset_init.sh"]
+ENV SUPERSET_CONFIG_PATH=/app/pythonpath/superset_config.py
+CMD ["/bin/bash", "/app/docker-init/superset_init.sh"]

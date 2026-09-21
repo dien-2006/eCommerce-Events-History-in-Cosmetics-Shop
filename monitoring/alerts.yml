@@ -1,0 +1,27 @@
+groups:
+  - name: lakehouse
+    rules:
+      - alert: LakehouseExporterUnavailable
+        expr: up{job="lakehouse"} == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: Cannot read pipeline operational metadata
+      - alert: LakehouseRunFailed
+        expr: lakehouse_last_run_failed == 1
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: 'Latest {{ $labels.project }} run failed; inspect Airflow task logs'
+      - alert: LakehousePublicationStale
+        expr: time() - lakehouse_last_success_timestamp_seconds > 93600
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: 'No successful {{ $labels.project }} run for 26 hours'
+      - alert: LakehouseStageStuck
+        expr: lakehouse_running_stage_age_seconds > 10800
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: 'A stage exceeded its 3-hour budget'

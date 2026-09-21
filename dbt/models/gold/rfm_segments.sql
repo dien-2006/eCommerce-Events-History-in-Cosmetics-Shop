@@ -1,60 +1,25 @@
-{{ config(
-    materialized="incremental",
-    incremental_strategy="append",
-    on_schema_change="append_new_columns",
-    unique_key="snapshot_user_key"
-) }}
-
+{{ config(partition_by=['snapshot_date']) }}
 with purchases as (
-  select
-    user_id,
-    event_date,
-    price
-  from {{ ref('stg_events') }}
-  where event_type = 'purchase'
-),
-
-snapshot as (
-  select cast(current_date() as date) as snapshot_date
-),
-
-rfm as (
-  select
-    s.snapshot_date,
-    p.user_id,
-    datediff(s.snapshot_date, max(p.event_date)) as recency_days,
-    count(*) as frequency,
-    sum(p.price) as monetary
-  from purchases p
-  cross join snapshot s
-  group by s.snapshot_date, p.user_id
-),
-
-scored as (
-  select
-    *,
-    ntile(5) over (order by recency_days asc) as r_score,
-    ntile(5) over (order by frequency desc) as f_score,
-    ntile(5) over (order by monetary desc) as m_score
+  select * from {{ ref('stg_events') }}
+  where event_type='purchase' and event_date <= {{ analysis_date() }}
+), rfm as (
+  select {{ analysis_date() }} as snapshot_date, user_id,
+    datediff({{ analysis_date() }}, max(event_date)) as recency_days,
+    count(distinct user_session) as frequency,
+    cast(sum(price) as decimal(20, 2)) as monetary
+  from purchases group by user_id
+), scored as (
+  -- Best values receive 5. percent_rank keeps tied metric values together.
+  select *,
+    cast(5 - floor(4 * percent_rank() over (order by recency_days asc)) as int) as r_score,
+    cast(5 - floor(4 * percent_rank() over (order by frequency desc)) as int) as f_score,
+    cast(5 - floor(4 * percent_rank() over (order by monetary desc)) as int) as m_score
   from rfm
-),
-
-segmented as (
-  select
-    *,
-    case
-      when r_score >= 4 and f_score >= 4 and m_score >= 4 then 'champions'
-      when r_score >= 4 and f_score >= 3 then 'loyal'
-      when r_score <= 2 and f_score <= 2 then 'at_risk'
-      else 'others'
-    end as segment
-  from scored
 )
-
-select
-  *,
-  concat_ws('__', cast(snapshot_date as string), cast(user_id as string)) as snapshot_user_key
-from segmented
-{% if is_incremental() %}
-where snapshot_date > (select coalesce(max(snapshot_date), date('1900-01-01')) from {{ this }})
-{% endif %}
+select *, case
+  when r_score>=4 and f_score>=4 and m_score>=4 then 'champions'
+  when r_score>=3 and f_score>=4 then 'loyal'
+  when r_score<=2 and f_score>=3 then 'at_risk'
+  when r_score<=2 and f_score<=2 then 'hibernating'
+  else 'others' end as segment
+from scored

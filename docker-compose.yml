@@ -1,264 +1,314 @@
-name: cosmetics-lakehouse
+name: ${COMPOSE_PROJECT_NAME:-cosmetics_elt_v2}
 
-networks:
-  lakehouse_net:
-    name: ${DOCKER_NETWORK_NAME}
-    driver: bridge
+x-common: &common
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
 
-volumes:
-  minio_data:
-  clickhouse_data:
-  superset_db_data:
-  superset_redis_data:
+x-pipeline-env: &pipeline-env
+  PYTHONPATH: /opt/project
+  PROJECT_CONFIG: /opt/project/config/projects.yml
+  S3_ENDPOINT: http://minio:9000
+  S3_BUCKET: ${S3_BUCKET:?Run scripts/bootstrap.py}
+  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+  OPS_DATABASE_URL: postgresql://pipeline:${OPS_DB_PASSWORD:?}@postgres:5432/operations
+  SPARK_THRIFT_HOST: spark-thrift
+  SPARK_THRIFT_PORT: "10000"
+  CLICKHOUSE_HOST: clickhouse
+  CLICKHOUSE_PORT: "8123"
+  CLICKHOUSE_USER: ${CLICKHOUSE_USER:-pipeline}
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
+  CLICKHOUSE_DASHBOARD_PASSWORD: ${CLICKHOUSE_DASHBOARD_PASSWORD:?}
+  ARTIFACTS_DIR: /opt/airflow/artifacts
+  DBT_SEND_ANONYMOUS_USAGE_STATS: "false"
+
+x-airflow-env: &airflow-env
+  <<: *pipeline-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?}@postgres:5432/airflow
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?}
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?}
+  AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET:?}
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+  AIRFLOW__CORE__PARALLELISM: "2"
+  AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+
+x-airflow: &airflow
+  <<: *common
+  image: cosmetics-airflow:3.1.7-v2
+  build:
+    context: .
+    dockerfile: infra/airflow/Dockerfile
+  user: "${AIRFLOW_UID:-50000}:0"
+  environment: *airflow-env
+  volumes:
+    - airflow_logs:/opt/airflow/logs
+    - airflow_artifacts:/opt/airflow/artifacts
+    - ${RAW_DATA_DIR:-./data/rawdata}:/data/rawdata:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    airflow-init:
+      condition: service_completed_successfully
 
 services:
+  postgres:
+    <<: *common
+    image: postgres:16.10-bookworm
+    environment:
+      POSTGRES_USER: platform_admin
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --encoding=UTF8
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?}
+      ICEBERG_DB_PASSWORD: ${ICEBERG_DB_PASSWORD:?}
+      OPS_DB_PASSWORD: ${OPS_DB_PASSWORD:?}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:?}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/01_databases.sh:/docker-entrypoint-initdb.d/01_databases.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U platform_admin -d postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 768m
+
   minio:
+    <<: *common
     image: minio/minio:RELEASE.2025-09-07T16-13-09Z
-    container_name: minio
-    command: server /data --console-address ":9001"
+    command: server /data --console-address :9001
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
     ports:
-      - "${MINIO_API_PORT}:9000"
-      - "${MINIO_CONSOLE_PORT}:9001"
-    volumes:
-      - minio_data:/data
-    networks:
-      - lakehouse_net
+      - "${BIND_ADDRESS:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes: [minio_data:/data]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+      test: [CMD, curl, -f, http://localhost:9000/minio/health/live]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 768m
 
-  minio_init:
+  minio-init:
     image: minio/mc:RELEASE.2025-08-13T08-35-41Z
-    container_name: minio-init
     depends_on:
       minio:
         condition: service_healthy
     environment:
-      MINIO_ALIAS: ${MINIO_ALIAS}
-      MINIO_ENDPOINT: ${MINIO_ENDPOINT_INTERNAL}
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-      MINIO_BUCKET: ${MINIO_BUCKET}
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["/scripts/create_bucket.sh"]
-    volumes:
-      - ./scripts/create_bucket.sh:/scripts/create_bucket.sh:ro
-    networks:
-      - lakehouse_net
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?}
+      S3_BUCKET: ${S3_BUCKET:?}
+    entrypoint: [/bin/sh, -ec]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" >/dev/null
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+        mc version enable "local/$${S3_BUCKET}"
 
-  iceberg_rest:
-    image: tabulario/iceberg-rest:1.6.0
-    container_name: iceberg-rest
+  spark-thrift:
+    <<: *common
+    image: cosmetics-spark:3.5.7-iceberg1.10-v2
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
     environment:
-      # NOTE: this image is a lightweight REST catalog for experimentation.
-      # These env vars are used by common Iceberg REST fixtures; if your image build differs,
-      # see docs/README_TROUBLESHOOTING.md for fallback options.
-      CATALOG_WAREHOUSE: ${ICEBERG_WAREHOUSE}
-      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      AWS_REGION: ${AWS_REGION}
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
-      AWS_ENDPOINT: ${MINIO_ENDPOINT_INTERNAL}
-      AWS_S3_PATH_STYLE_ACCESS: "true"
+      S3_ENDPOINT: http://minio:9000
+      S3_BUCKET: ${S3_BUCKET:?}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:?}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?}
+      AWS_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      ICEBERG_DB_PASSWORD: ${ICEBERG_DB_PASSWORD:?}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-3g}
+      SPARK_LOCAL_CORES: ${SPARK_LOCAL_CORES:-2}
     ports:
-      - "${ICEBERG_REST_PORT}:8181"
-    networks:
-      - lakehouse_net
-    depends_on:
-      minio:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8181/"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-
-  spark-master:
-    image: spark:3.5.7-java17-python3
-    container_name: spark-master
-    hostname: spark-master
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
-    environment:
-      SPARK_NO_DAEMONIZE: "true"
-      SPARK_MASTER_HOST: spark-master
-      SPARK_MASTER_PORT: "7077"
-      SPARK_MASTER_WEBUI_PORT: "8080"
-    ports:
-      - "${SPARK_MASTER_UI_PORT}:8080"
-      - "${SPARK_MASTER_PORT}:7077"
+      - "${BIND_ADDRESS:-127.0.0.1}:${SPARK_UI_PORT:-4040}:4040"
     volumes:
-      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-      - ./spark/jars:/opt/spark/jars
-      - ./spark/jobs:/opt/spark/jobs:ro
-      - ./data:/data
-    networks:
-      - lakehouse_net
+      - spark_events:/opt/spark/events
+      - spark_work:/opt/spark/work
     depends_on:
-      iceberg_rest:
+      postgres:
         condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-
-  spark-worker-1:
-    image: spark:3.5.7-java17-python3
-    container_name: spark-worker-1
-    hostname: spark-worker-1
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
-    environment:
-      SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: "2g"
-      SPARK_WORKER_WEBUI_PORT: "8081"
-    ports:
-      - "${SPARK_WORKER1_UI_PORT}:8081"
-    volumes:
-      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-      - ./spark/jars:/opt/spark/jars
-      - ./spark/jobs:/opt/spark/jobs:ro
-      - ./data:/data
-    networks:
-      - lakehouse_net
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8081/"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-
-  spark-worker-2:
-    image: spark:3.5.7-java17-python3
-    container_name: spark-worker-2
-    hostname: spark-worker-2
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077"]
-    environment:
-      SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: "2g"
-      SPARK_WORKER_WEBUI_PORT: "8082"
-    ports:
-      - "${SPARK_WORKER2_UI_PORT}:8082"
-    volumes:
-      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
-      - ./spark/jars:/opt/spark/jars
-      - ./spark/jobs:/opt/spark/jobs:ro
-      - ./data:/data
-    networks:
-      - lakehouse_net
-    depends_on:
-      spark-master:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8082/"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
+      test: [CMD, /opt/spark/bin/beeline, -u, 'jdbc:hive2://localhost:10000/default;auth=noSasl', -e, SELECT 1]
+      interval: 30s
+      timeout: 20s
+      retries: 10
+      start_period: 90s
+    mem_limit: 5g
+    stop_grace_period: 60s
 
   clickhouse:
-    image: clickhouse/clickhouse-server:25.12.6.38-jammy
-    container_name: clickhouse
+    <<: *common
+    image: clickhouse/clickhouse-server:25.8.33.6
     environment:
-      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-pipeline}
+      CLICKHOUSE_DB: cosmetics_analytics
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_DASHBOARD_PASSWORD: ${CLICKHOUSE_DASHBOARD_PASSWORD:?}
     ports:
-      - "${CLICKHOUSE_HTTP_PORT}:8123"
-      - "${CLICKHOUSE_NATIVE_PORT}:9000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${CLICKHOUSE_HTTP_PORT:-8123}:8123"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      - ./clickhouse/config.d:/etc/clickhouse-server/config.d:ro
-      - ./clickhouse/initdb:/docker-entrypoint-initdb.d:ro
-    networks:
-      - lakehouse_net
-    depends_on:
-      minio:
-        condition: service_healthy
+      - ./infra/clickhouse/logging.xml:/etc/clickhouse-server/config.d/logging.xml:ro
+      - ./infra/clickhouse/users.xml:/etc/clickhouse-server/users.d/dashboard.xml:ro
     healthcheck:
-      test: ["CMD", "bash", "-lc", "clickhouse-client --host localhost --query 'SELECT 1'"]
+      test: [CMD-SHELL, 'CLICKHOUSE_PASSWORD="$${CLICKHOUSE_PASSWORD}" clickhouse-client --user "$${CLICKHOUSE_USER}" --query "SELECT 1"']
       interval: 10s
       timeout: 5s
-      retries: 30
+      retries: 20
+    mem_limit: 2g
+    ulimits:
+      nofile: {soft: 262144, hard: 262144}
 
-  superset-db:
-    image: postgres:16.2-alpine
-    container_name: superset-db
+  airflow-init:
+    <<: *airflow
+    restart: "no"
+    # Preserve the official entrypoint: it initializes arbitrary AIRFLOW_UID users.
+    command: [bash, /opt/project/airflow-init.sh]
     environment:
-      POSTGRES_DB: ${SUPERSET_DB_NAME}
-      POSTGRES_USER: ${SUPERSET_DB_USER}
-      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD}
-    ports:
-      - "${SUPERSET_DB_PORT}:5432"
-    volumes:
-      - superset_db_data:/var/lib/postgresql/data
-    networks:
-      - lakehouse_net
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_DB_USER} -d ${SUPERSET_DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-
-  superset-redis:
-    image: redis:7.2.5-alpine
-    container_name: superset-redis
-    ports:
-      - "${SUPERSET_REDIS_PORT}:6379"
-    volumes:
-      - superset_redis_data:/data
-    networks:
-      - lakehouse_net
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 30
-
-  superset:
-    build:
-      context: ./superset
-      dockerfile: Dockerfile
-    container_name: superset
-    environment:
-      SUPERSET_ENV: production
-      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
-      SUPERSET_LOAD_EXAMPLES: "no"
-      SUPERSET_PORT: "8088"
-      DATABASE_DB: ${SUPERSET_DB_NAME}
-      DATABASE_HOST: superset-db
-      DATABASE_PASSWORD: ${SUPERSET_DB_PASSWORD}
-      DATABASE_USER: ${SUPERSET_DB_USER}
-      DATABASE_PORT: "5432"
-      DATABASE_DIALECT: postgresql
-      REDIS_HOST: superset-redis
-      REDIS_PORT: "6379"
-      # enable clickhouse dialect via clickhouse-connect installed in Dockerfile
-    ports:
-      - "${SUPERSET_PORT}:8088"
-    volumes:
-      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
-      - ./superset/init:/app/docker-init:ro
-    networks:
-      - lakehouse_net
+      <<: *airflow-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?}
+      AIRFLOW_ADMIN_EMAIL: ${AIRFLOW_ADMIN_EMAIL:-admin@example.com}
     depends_on:
-      superset-db:
+      postgres:
         condition: service_healthy
-      superset-redis:
+
+  airflow-apiserver:
+    <<: *airflow
+    command: api-server
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${AIRFLOW_PORT:-8080}:8080"
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8080/api/v2/version]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    mem_limit: 1g
+
+  airflow-scheduler:
+    <<: *airflow
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      airflow-apiserver:
+        condition: service_healthy
+      spark-thrift:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8088/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 40
+      test: [CMD, curl, --fail, http://localhost:8974/health]
+      interval: 20s
+      timeout: 10s
+      retries: 20
+    mem_limit: 2g
+    stop_grace_period: 120s
+
+  airflow-dag-processor:
+    <<: *airflow
+    command: dag-processor
+    healthcheck:
+      test: [CMD-SHELL, 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 20s
+      retries: 10
+    mem_limit: 1g
+
+  superset:
+    <<: *common
+    image: cosmetics-superset:6.0.0-v2
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    profiles: [bi]
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:?}
+      SUPERSET_DB_PASSWORD: ${SUPERSET_DB_PASSWORD:?}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:?}
+      CLICKHOUSE_DASHBOARD_PASSWORD: ${CLICKHOUSE_DASHBOARD_PASSWORD:?}
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${SUPERSET_PORT:-8088}:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, curl, --fail, http://localhost:8088/health]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+    mem_limit: 1536m
+
+  metrics:
+    <<: *common
+    image: cosmetics-airflow:3.1.7-v2
+    profiles: [observability]
+    entrypoint: [/opt/pipeline-venv/bin/python, -m, lakehouse.metrics]
+    environment: *pipeline-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    mem_limit: 256m
+
+  prometheus:
+    <<: *common
+    image: prom/prometheus:v3.5.0
+    profiles: [observability]
+    command: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.retention.time=30d]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090"
+    mem_limit: 512m
+
+  grafana:
+    <<: *common
+    image: grafana/grafana:12.1.1
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    mem_limit: 384m
+
+volumes:
+  postgres_data:
+  minio_data:
+  spark_events:
+  spark_work:
+  clickhouse_data:
+  airflow_logs:
+  airflow_artifacts:
+  prometheus_data:
+  grafana_data:

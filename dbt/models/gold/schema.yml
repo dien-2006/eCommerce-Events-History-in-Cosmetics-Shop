@@ -1,30 +1,26 @@
 version: 2
-
 models:
-  - name: funnel_steps_daily
-    columns:
-      - name: event_date
-        tests: [not_null, unique]
-      - name: users_purchase
-        tests: [not_null]
-
   - name: daily_sales_by_category
+    description: Revenue by UTC date, category and brand. Does not claim order-level AOV.
     columns:
       - name: event_date
-        tests: [not_null]
-      - name: category_code
-        tests: [not_null]
-      - name: event_date__category_code
-        tests: [not_null, unique]
-
-  - name: rfm_segments
+        data_tests: [not_null]
+      - name: revenue
+        data_tests: [not_null]
+  - name: funnel_steps_daily
+    description: Ordered session funnel attributed to session start date.
     columns:
-      - name: snapshot_date
-        tests: [not_null]
+      - name: event_date
+        data_tests: [not_null, unique]
+  - name: rfm_segments
+    description: Current selected as-of snapshot. Frequency counts purchasing sessions; 5 is best.
+    columns:
       - name: user_id
-        tests: [not_null]
+        data_tests: [not_null, unique]
+      - name: snapshot_date
+        data_tests: [not_null]
       - name: segment
-        tests:
-          - not_null
+        data_tests:
           - accepted_values:
-              values: ["champions", "loyal", "at_risk", "others"]
+              arguments:
+                values: [champions, loyal, at_risk, hibernating, others]
